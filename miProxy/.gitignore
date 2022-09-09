@@ -1,0 +1,3 @@
+*.o
+sample_*
+*log.txt

@@ -1,0 +1,503 @@
+#include "miProxy.h"
+#include "DNSHeader.h"
+#include "DNSQuestion.h"
+#include "DNSRecord.h"
+
+#include <string.h>
+#include <stdlib.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <stdint.h>
+#include <netdb.h>
+#include <error.h>
+#include <stdio.h>
+#include <errno.h>
+
+#include <iostream>
+#include <string>
+#include <iomanip>
+#include <cstdio>
+#include <map>
+#include <vector>
+#include <limits>
+#include <sys/time.h>
+
+using namespace std;
+
+MiProxy::MiProxy(int port, string www_ip, double alpha, ofstream* log_file_p, int opt):
+  socket_(-1), port_(port), www_ip_(www_ip), alpha_(alpha), log_file_(log_file_p), opt_(opt) {}
+
+MiProxy::MiProxy(int port, string dns_ip, int dns_port, double alpha, ofstream* log_file_p, int opt):
+  socket_(-1), port_(port), dns_ip_(dns_ip), dns_port_(dns_port), alpha_(alpha), log_file_(log_file_p), opt_(opt) {}
+
+MiProxy::~MiProxy() {
+  if (socket_ != -1) {
+    close(socket_);
+    log_file_->close();
+  }
+}
+
+bool MiProxy::SetupSocket(){
+  // create a socket
+  socket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (socket_ == -1) {
+    cerr << "Error: bad socket\n";
+    return false;
+  }
+  int ok = 1;
+  // to reuse ports
+  if (setsockopt(socket_, SOL_SOCKET, SO_REUSEADDR, &ok, sizeof(ok)) == -1) {
+    cerr << "Error: bad setsockopt\n";
+    return false;
+  }
+  struct sockaddr_in addr;
+  socklen_t length = (socklen_t)sizeof(addr);
+  memset(&addr, 0, length);
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  addr.sin_port = htons(port_);
+  // bind address to our socket
+  if (bind(socket_, (const struct sockaddr *)&addr, length) == -1) {
+    cerr << "Error: bad bind\n";
+    return false;
+  }
+  // listen for connections
+  if (listen(socket_, 10) == -1) {
+    cerr << "Error: bad listen\n";
+    return false;
+  }
+
+  return true;
+}
+
+void MiProxy::Start() {
+  int num_recvd, activity;
+
+  std::array<int,30> client_sockets;
+  client_sockets.fill(0);
+
+  struct sockaddr_in client_addr;
+  socklen_t length = (socklen_t)sizeof(client_addr);
+
+  fd_set readfds;
+  while (true) {
+    FD_ZERO(&readfds);
+    // add master socket to set
+    FD_SET(socket_, &readfds);
+    for (const auto &client_sock : client_sockets) {
+      if (client_sock != 0) {
+        FD_SET(client_sock, &readfds);
+      }
+    }
+    // wait for an activity on one of the sockets , timeout is NULL ,
+    // so wait indefinitely
+    activity = select(FD_SETSIZE, &readfds, NULL, NULL, NULL);
+    if ((activity < 0) && (errno != EINTR)) {
+      perror("select error");
+    }
+
+    // If something happened on the master socket ,
+    // then its an incoming connection, call accept()
+    if (FD_ISSET(socket_, &readfds)) {
+      int new_socket = accept(socket_, (struct sockaddr *)&client_addr, (unsigned int *)&length);
+      if (new_socket < 0) {
+        perror("accept");
+        exit(EXIT_FAILURE);
+      }
+
+      // add new socket to the array of sockets
+      for (auto &client_sock : client_sockets) {
+        // if position is empty
+        if (client_sock == 0) {
+          client_sock = new_socket;
+          break;
+        }
+      }
+    }
+
+    // else it's some IO operation on a client socket
+    for (auto &client_sock : client_sockets) {
+      if (client_sock != 0 && FD_ISSET(client_sock, &readfds)) {
+        // Check if it was for closing , and also read the
+        // incoming message
+        struct sockaddr_in address;
+        socklen_t address_len = (socklen_t) sizeof(address);
+        getpeername(client_sock, (struct sockaddr *)&address, (unsigned int *)&address_len);
+        char buffer[1025];
+        int valread = read(client_sock, buffer, 1024);
+        if (valread == 0) {
+          close(client_sock);
+          client_sock = 0;
+        }
+        else {
+          buffer[valread] = '\0';
+          string client_ip = inet_ntoa(address.sin_addr);
+          printf("\n---New message---\n");
+          printf("Message \n%s\n", buffer);
+          printf("Received from: ip %s , port %d \n",
+                 inet_ntoa(address.sin_addr), ntohs(address.sin_port));
+
+          string buffer_s (buffer);
+          string nolist_request_s;
+          if (buffer_s.find("big_buck_bunny.f4m") != string::npos) {
+            int dot_f4m_pos = buffer_s.find(".f4m");
+            string before_dot = buffer_s.substr(0, dot_f4m_pos);
+            string starting_dot = buffer_s.substr(dot_f4m_pos, string::npos);
+            nolist_request_s = before_dot + "_nolist" + starting_dot;
+          }
+          cout << "--Nolist request string size--" << endl;
+          cout << nolist_request_s.size() << endl;
+
+
+          if (nolist_request_s.size() != 0) {
+            int video_server_socket = GetVideoServerSocket_();
+            send(video_server_socket, nolist_request_s.c_str(), nolist_request_s.size(), 0);
+            char recv_buffer[1025];
+            int num_recvd = recv(video_server_socket, recv_buffer, 1024, 0);
+            recv_buffer[num_recvd] = '\0';
+            cout << "---Server Init Response Nolist---" << endl;
+            cout << recv_buffer << endl;
+
+            // get content_len and header_len
+            int content_len;
+            int header_len;
+            string response(recv_buffer);
+            int pos = response.find("\r\n\r\n");
+            header_len = pos + 4;
+            int cpos = response.find("Content-Length:");
+            int npos = response.find("\n", cpos);
+            string temp = response.substr(cpos + 16, npos - cpos - 16);
+            content_len = stoi(temp);
+            cout << "---Content Length---" << endl;
+            cout << content_len << endl;
+
+            // get whole chunk
+            char whole_chunk[content_len + header_len];
+            memcpy(whole_chunk, recv_buffer, num_recvd);
+            while (num_recvd < content_len + header_len) {
+              char cur_buffer[1025];
+              int cur_recvd = recv(video_server_socket, cur_buffer, 1024, 0);
+              memcpy(whole_chunk + num_recvd, cur_buffer, cur_recvd);
+              num_recvd += cur_recvd;
+            }
+
+            cout << "--Whole Chunk Nolist--" << endl;
+            cout << whole_chunk << endl;
+
+            send(client_sock, whole_chunk, content_len + header_len, 0);
+            close(video_server_socket);
+          }
+
+
+
+
+
+
+
+
+          int video_server_socket = GetVideoServerSocket_();
+          string modded_request = ModRequest(buffer, client_ip);
+          send(video_server_socket, modded_request.c_str(), modded_request.size(), 0);
+          char recv_buffer[1025];
+          int num_recvd = recv(video_server_socket, recv_buffer, 1024, 0);
+          cout << "After RECV" << endl;
+          recv_buffer[num_recvd] = '\0';
+          cout << "---Server Init Response---" << endl;
+          cout << recv_buffer << endl;
+
+          // get content_len and header_len
+          int content_len;
+          int header_len;
+          string response(recv_buffer);
+          int pos = response.find("\r\n\r\n");
+          header_len = pos + 4;
+          int cpos = response.find("Content-Length:");
+          int npos = response.find("\n", cpos);
+          string temp = response.substr(cpos + 16, npos - cpos - 16);
+          content_len = stoi(temp);
+          cout << "---Content Length---" << endl;
+          cout << content_len << endl;
+
+          struct timeval current_time;
+          struct timeval start_time;
+          string request (buffer);
+          int seg_pos = request.find("Seg");
+          if (seg_pos != string::npos) {
+            gettimeofday(&start_time, NULL);
+          }
+
+          // get whole chunk
+          char whole_chunk[content_len + header_len];
+          memcpy(whole_chunk, recv_buffer, num_recvd);
+          while (num_recvd < content_len + header_len) {
+            char cur_buffer[1025];
+            int cur_recvd = recv(video_server_socket, cur_buffer, 1024, 0);
+            memcpy(whole_chunk + num_recvd, cur_buffer, cur_recvd);
+            num_recvd += cur_recvd;
+          }
+          if (seg_pos != string::npos) {
+            gettimeofday(&current_time, NULL);
+            double diff_time = current_time.tv_sec - start_time.tv_sec + double(current_time.tv_usec - start_time.tv_usec)/1000000;
+            double received = double(content_len + header_len - 1)/1000;
+            double T_new = double(content_len + header_len - 1)*8/1000000/diff_time * 1000;
+            cout << bitrates_.front() << endl;
+            if (client_ip_avg_throughput.find(client_ip) != client_ip_avg_throughput.end()) {
+              client_ip_avg_throughput[client_ip] = bitrates_.front();
+            }
+            client_ip_avg_throughput[client_ip] = alpha_ * T_new + (1 - alpha_) * client_ip_avg_throughput[client_ip];
+          }
+
+          cout << "--Whole Chunk--" << endl;
+          cout << whole_chunk << endl;
+
+          // parse f4m
+          if (bitrates_.size() == 0) {
+            string whole_chunk_s (whole_chunk);
+            int content_type_pos = whole_chunk_s.find("Content-Type: ");
+            string content_type = whole_chunk_s.substr(content_type_pos + 14, 8);
+            cout << "---Content Type---" << endl;
+            cout << content_type << endl;
+            if (content_type == "text/xml") {
+              int media_pos = whole_chunk_s.find("<media");
+              while (media_pos != string::npos) {
+                int meta_pos = whole_chunk_s.find("<meta", media_pos);
+                string media_header = whole_chunk_s.substr(media_pos, meta_pos - media_pos);
+                int bitrate_pos = media_header.find("bitrate=");
+                int bootstrap_pos = media_header.find("bootstrap");
+                string bitrate_s = media_header.substr(bitrate_pos + 9, bootstrap_pos - bitrate_pos - 9 - 2);
+                bitrates_.push_back(stod(bitrate_s));
+                media_pos = whole_chunk_s.find("<media", media_pos+1);
+              }
+            }
+          }
+
+          // foward
+          if (nolist_request_s.size() == 0) {
+            send(client_sock, whole_chunk, content_len + header_len, 0);
+          }
+          close(video_server_socket);
+        }
+      }
+    }
+  }
+}
+
+string MiProxy::ModRequest(char* buffer, string client_ip) {
+  string buffer_s (buffer);
+  int seg_pos = buffer_s.find("Seg");
+  if (seg_pos != string::npos) {
+      int vod_pos = buffer_s.find("/vod/");
+      string before_bitrate = buffer_s.substr(0, vod_pos + 5);
+      string starting_seg = buffer_s.substr(seg_pos, string::npos);
+      int bitrate;
+      if (bitrates_.size() == 0) {
+        bitrate = 10;
+      }
+      else {
+        if (client_ip_avg_throughput.find(client_ip) == client_ip_avg_throughput.end()) {
+          bitrate = int(bitrates_.front());
+        }
+        else {
+          bitrate = int(find_small_(bitrates_, client_ip_avg_throughput[client_ip]));
+        }
+      }
+      string new_buffer = before_bitrate + to_string(bitrate) + starting_seg;
+      cout << "---New Buffer---" << endl;
+      cout << new_buffer << endl;
+      cout << "---New Buffer Size---" << endl;
+      cout << new_buffer.size() << endl;
+      return new_buffer;
+  }
+  else {
+    string new_buffer(buffer);
+    return new_buffer;
+  }
+
+}
+
+int MiProxy::GetVideoServerSocket_() {
+  string video_server_ip;
+  if (opt_ == 0) {
+    video_server_ip = www_ip_;
+  }
+  else {
+    cout << "hi" << endl;
+    video_server_ip = QueryDNS(dns_ip_, dns_port_);
+    cout << "---------Video_SERVER_IP inferred-------" << endl;
+    cout << video_server_ip << endl;
+  }
+  int cur_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (cur_socket == -1) {
+    cerr << "Error: bad socket\n";
+    return -1;
+  }
+  struct sockaddr_in addr;
+  addr.sin_family = AF_INET;
+  // resolve the address of the server
+  cout << "before getting host V" << endl;
+  struct hostent *host = gethostbyname(video_server_ip.c_str());
+  cout << "after  getting host V" << endl;
+  if (host == nullptr) {
+    cerr << "Error: bad hostname\n";
+    return -1;
+  }
+  memcpy(&(addr.sin_addr), host->h_addr, host->h_length);
+  addr.sin_port = htons(80);
+  // connect to the server
+  if (connect(cur_socket, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+    cerr << "Error: bad connect\n";
+    return -1;
+  }
+  return cur_socket;
+}
+
+
+string MiProxy::QueryDNS(string dnsIP, int dnsPort) {
+    //2)connect to dns server
+    int sockfd2 = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sockfd2 == -1) {
+      cerr << "Error: bad socket\n";
+      return "";
+    }
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    // resolve the address of the server
+    cout << "before getting host" << endl;
+    struct hostent *host = gethostbyname(dnsIP.c_str());
+    cout << "after getting host" << endl;
+    if (host == nullptr) {
+      cerr << "Error: bad hostname\n";
+      return "";
+    }
+    memcpy(&(addr.sin_addr), host->h_addr, host->h_length);
+    addr.sin_port = htons(dnsPort);
+    // connect to the server
+    if (connect(sockfd2, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+      cerr << "Error: bad connect\n";
+      return "";
+    }
+    //3)make a DNS header struct object
+    DNSHeader header;
+    memset(&header,0,sizeof(header));
+    //4)Set DNS header fields
+    header.QR = 0;
+    header.OPCODE = 0;
+    header.AA = 0;
+    header.RD = 0;
+    header.RA = 0;
+    header.Z = 0;
+    header.NSCOUNT = 0;
+    header.ARCOUNT = 0;
+    header.ANCOUNT = 0;
+    header.QDCOUNT = 1;
+    header.TC = 0;
+    header.RCODE = 0;
+    //5)make DNS header a string so it can be sent
+    string hstr = header.encode(header);
+    //6)send dns header length length
+    int hlen = hstr.length();
+    int hlen_send = htonl(hlen);
+    int status = send(sockfd2,&hlen_send,sizeof(hlen_send),0);
+    if (status == -1){
+        perror("SEND ERROR");
+        exit(EXIT_FAILURE);
+    }
+    //7)send dns header
+    status = send(sockfd2,hstr.c_str(),hlen,0);
+    if (status == -1){
+        perror("SEND ERROR");
+        exit(EXIT_FAILURE);
+    }
+    //8)make DNS question object
+    DNSQuestion question;
+    memset(&question, 0, sizeof(question));
+    question.QTYPE = 1;
+    question.QCLASS = 1;
+    //It responds only to requests for video.cse.umich.edu
+    strcpy(question.QNAME,"video.cse.umich.edu");
+
+    //9)make DNS question a string so it can be sent
+    string qstr = question.encode(question);
+    //10) Sned dns question and its corresbonding length
+    //length
+    int qlen = qstr.length();
+    int qlen_send = htonl(qlen);
+    status = send(sockfd2,&qlen_send,sizeof(qlen_send),0);
+    if (status == -1){
+        perror("SEND ERROR");
+        exit(EXIT_FAILURE);
+    }
+    //question
+    status = send(sockfd2,qstr.c_str(),qlen,0);
+
+    //11)recive replys from DNS server
+    //12) recvs() integer designating size of DNS Header
+    hlen = 0;
+    status = recv(sockfd2,&hlen,sizeof(hlen),MSG_WAITALL);
+    if (status == -1){
+        perror("RECV ERROR");
+        exit(EXIT_FAILURE);
+    }
+    //convert to readable int
+    hlen = ntohl(hlen);
+    //make buffer to recive
+    char reciveBuffer[hlen+1];
+    memset(reciveBuffer,0,hlen);
+    //actually recive the header
+    status = recv(sockfd2,reciveBuffer,hlen,MSG_WAITALL);
+    if (status == -1){
+        perror("RECV ERROR");
+        exit(EXIT_FAILURE);
+    }
+    //13)recvs() DNS header via decode()
+    string decode_string = string(reciveBuffer);
+    DNSHeader new_header = new_header.decode(decode_string);
+    //14)recvs() integer designating size of DNS Record
+    int dnslen;
+    status = recv(sockfd2,&dnslen,sizeof(int),MSG_WAITALL);
+    if (status == -1){
+        perror("RECV ERROR");
+        exit(EXIT_FAILURE);
+    }
+    dnslen = ntohl(dnslen);
+    //15) recvs() DNS Record via decode()
+    char reciveBuffer2[dnslen+1];
+    reciveBuffer2[dnslen] = '\0';
+    status = recv(sockfd2,reciveBuffer2,dnslen,MSG_WAITALL);
+    if (status == -1){
+        perror("RECV ERROR");
+        exit(EXIT_FAILURE);
+    }
+
+    DNSRecord dnsr = DNSRecord::decode(string(reciveBuffer2, dnslen));
+     //16) determine server ip
+     cout << dnsr.NAME<< endl;
+    cout << "------------RDLENGTH--------------" << endl;
+    cout << dnsr.RDLENGTH << endl;
+    cout << "-------------RDATA----------------" << endl;
+    cout << dnsr.RDATA << endl;
+    string ip = string(dnsr.RDATA,dnsr.RDLENGTH);
+    cout << "------------IP--------------" << endl;
+    cout << ip << endl;
+    //17)close server socket
+    close(sockfd2);
+    //17)return ip
+    return ip;
+}
+
+double MiProxy::find_small_(vector<double>& bitrates, double cur_throughput) {
+  cout << "finding birate" << endl;
+  double rval;
+  for (double i : bitrates){
+      if (1.5 * i <= cur_throughput){
+          rval = i;
+      }
+      else{
+          break;
+      }
+  }//for
+  if(cur_throughput == 0){
+      rval = bitrates.front();
+  }
+  return rval;
+}
